@@ -1,154 +1,711 @@
-# Lyftr LLM Chatbot: key failover and response caching
+# Lyftr LLM Chatbot
 
-A small full-stack chatbot. FastAPI + LiteLLM on the back, React + Vite on the front, SQLite for sessions.
-Two things are done carefully: **ordered API-key failover** (with exact accounting of which key served a reply) and **response caching** (cache hits are labelled, free, and fast).
+A full-stack LLM chatbot built with **FastAPI + LiteLLM**, **React + Vite**, and **SQLite**.
 
-## 1. Live URLS
+The project focuses on two reliability features that are easy to verify:
 
-This repository is not deployed to a public host. The running stack (after `make up`) is:
+- **Ordered API-key failover** — automatically falls back to the next configured key when a provider/key is unavailable, while accurately reporting which key served the response.
+- **Deterministic response caching** — repeated requests can be served without contacting the LLM provider, reducing latency and API usage.
 
-| What | URL |
+It also includes persistent multi-turn sessions, per-request token accounting, failure simulation, hardened validation, and Docker-based local deployment.
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
 | --- | --- |
-| Frontend (nginx) | http://localhost:3000 |
+| Frontend | React, Vite |
+| Backend | FastAPI, Python 3.11+ |
+| LLM Gateway | LiteLLM |
+| Database | SQLite |
+| Reverse Proxy | nginx |
+| Deployment | Docker Compose |
+| Testing | pytest |
+
+---
+
+## 1. Local URLs
+
+This repository is currently intended to run locally.
+
+After running `make up`:
+
+| Service | URL |
+| --- | --- |
+| Frontend | http://localhost:3000 |
 | Backend API | http://localhost:8000 |
-| Health check | http://localhost:8000/health |
-| Interactive API docs | http://localhost:8000/docs |
+| Health Check | http://localhost:8000/health |
+| Swagger / API Docs | http://localhost:8000/docs |
 
-## 2. Run locally: with Docker and without
+---
 
-### With Docker (recommended)
+## 2. Getting Started
+
+### Docker — Recommended
+
+Create your environment file and add at least one valid LLM API key:
 
 ```bash
-cp .env.example .env        # then put two real keys in LLM_API_KEYS
-make up                     # docker compose up -d --build
-# open http://localhost:3000
-make down                   # stop
-make test                   # backend test suite (needs the local Python setup below)
+cp .env.example .env
 ```
 
-`docker compose` waits for the backend healthcheck before starting the frontend. SQLite lives in the named volume `sqlite_data` mounted at `/data`, so history survives `make down`/`make up`.
+Set your keys:
 
-### Without Docker
+```env
+LLM_API_KEYS=key-one,key-two
+```
 
-Backend (Python 3.11+):
+Then start the application:
+
+```bash
+make up
+```
+
+Open:
+
+```text
+http://localhost:3000
+```
+
+Useful commands:
+
+```bash
+make up       # Build and start the stack
+make down     # Stop the stack
+make test     # Run backend tests
+```
+
+Docker Compose waits for the backend health check before starting the frontend.
+
+SQLite data is stored in the `sqlite_data` named volume mounted at `/data`, so chat history survives `make down` / `make up`.
+
+---
+
+### Run Without Docker
+
+#### Backend
+
+Requires **Python 3.11+**.
 
 ```bash
 cd backend
-python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+
+python -m venv .venv
+source .venv/bin/activate
+# Windows: .venv\Scripts\activate
+
 pip install -r requirements.txt
+
 export LLM_API_KEYS="key-one,key-two"
-export DATABASE_URL="sqlite:///./app.db"               # relative path; default is sqlite:////data/app.db
+export DATABASE_URL="sqlite:///./app.db"
 export ENABLE_FAILURE_SIMULATION=true
+
 uvicorn app.main:app --port 8000
 ```
 
-Frontend (Node 20+):
+#### Frontend
+
+Requires **Node.js 20+**.
 
 ```bash
 cd frontend
 npm install
-npm run dev          # http://localhost:3000, talks to http://localhost:8000
+npm run dev
 ```
 
-Tests (no network and no real keys needed, `litellm.acompletion` is mocked):
+The frontend runs at:
+
+```text
+http://localhost:3000
+```
+
+and communicates with:
+
+```text
+http://localhost:8000
+```
+
+#### Tests
+
+Tests do not require network access or real API keys because `litellm.acompletion` is mocked.
 
 ```bash
-cd backend && pytest -v
+cd backend
+pytest -v
 ```
 
-### Configuration
+---
 
-| Variable | Default | Meaning |
+## 3. Configuration
+
+| Variable | Default | Description |
 | --- | --- | --- |
-| `LLM_API_KEYS` | none, required | Comma-separated keys. Ids are `key_1`, `key_2`, ... in order. |
-| `LLM_MODEL` | `gemini/gemini-2.0-flash` | Any LiteLLM model string. |
-| `DATABASE_URL` | `sqlite:////data/app.db` | `sqlite:////abs/path.db` or `sqlite:///relative/path.db`. |
-| `ALLOWED_ORIGINS` | `http://localhost:3000` | Comma-separated CORS origins (read at startup). |
-| `ENABLE_FAILURE_SIMULATION` | off | `true` enables the `X-Simulate-Failure` header. |
-| `VITE_API_BASE_URL` | `http://localhost:8000` | Build-time API URL for the frontend. |
+| `LLM_API_KEYS` | Required | Comma-separated API keys. Internally identified as `key_1`, `key_2`, etc. |
+| `LLM_MODEL` | `gemini/gemini-2.0-flash` | Any supported LiteLLM model string. |
+| `DATABASE_URL` | `sqlite:////data/app.db` | SQLite database URL. |
+| `ALLOWED_ORIGINS` | `http://localhost:3000` | Comma-separated CORS origins. |
+| `ENABLE_FAILURE_SIMULATION` | `false` | Enables the `X-Simulate-Failure` test header. |
+| `VITE_API_BASE_URL` | `http://localhost:8000` | Frontend API URL, evaluated at build time. |
 
-## 3. Design decisions: key fallback, caching, SQLite session storage
+---
 
-**Key fallback.** `llm_gateway.generate` walks `[(key_1, ...), (key_2, ...), ...]` in order and calls `litellm.acompletion(..., num_retries=0)`. Retries are disabled on purpose: the gateway, not LiteLLM, decides when to move on, so `key_id` and `fallback_attempts` are exact.
-- A key is skipped on `429` / quota errors, timeouts (408 and timeout exceptions), connection errors, any `5xx`, and `401`/`403`. A revoked or invalid key is the case a second key exists for.
-- Other `4xx` errors, such as a malformed request, do not burn the next key. They return `502 {"detail": "provider rejected the request"}`.
-- If every key fails the API returns `503 {"detail": "all providers unavailable"}`.
-- Raw keys are only ever passed to LiteLLM. Responses carry `key_1`-style ids. Logs carry the id and the exception *class name*, never exception text, which providers sometimes echo with the credential in it.
+# 4. Architecture & Design
 
-**Caching.** `litellm.cache = Cache(type="local")` is configured at startup and `caching=True` is passed on live calls. The gateway also keeps a small in-process LRU keyed by `sha256(model + full ordered message array [system, ...history, new user message])`, checked before any provider call. Reasons:
-- Hits are deterministic and never touch a provider or a key. A hit reports `LLM_CACHE`, `key_id: null`, `fallback_attempts: 0`, and the stored per-request token counts.
-- Because the key is the whole message array, a different system prompt or different history is correctly a different entry.
-- Requests carrying `X-Simulate-Failure` skip the cache entirely (read and write), so failover is exercised even for repeated prompts.
+## Ordered API-Key Failover
 
-**SQLite session storage.** Stdlib `sqlite3` only, WAL mode, schema created at startup.
-- `sessions` holds the per-session `system_prompt`, so `messages` stays a clean transcript (user/assistant only).
-- Each turn is persisted in **one transaction** (`BEGIN IMMEDIATE` ... `COMMIT`): session upsert + user row + assistant row with JSON `metadata` and a UTC ISO-8601 `created_at`. A failed or invalid request writes nothing, and validation runs before the database is ever opened.
-- History is read `ORDER BY id ASC`. A per-session `asyncio.Lock` serialises read-history, LLM call and persist, so two quick sends in one session cannot interleave turns.
-- `input_tokens` / `output_tokens` are the provider's usage for that single request, never a running total.
+The gateway receives API keys in a defined order:
 
-**Validation.** `session_id` is trimmed to 1-128 characters. `message` is trimmed to 1-4000 characters. Both must be real JSON strings. Anything else, including malformed JSON, is a `422` with a compact `detail` list that does not echo the input back.
+```text
+key_1 → key_2 → ... → failure
+```
 
-## 4. Verification: how to see failover, cache hits and per-message token usage
+`llm_gateway.generate()` tries each configured key sequentially.
 
-Set `ENABLE_FAILURE_SIMULATION=true` and use two keys. Everything below can be done from the UI. The header dropdown sets `X-Simulate-Failure` and **New Session** starts a fresh `session_id`.
+LiteLLM is called with:
 
-**Health**
+```python
+num_retries=0
+```
+
+Retries are deliberately disabled at the LiteLLM layer. The application itself controls failover, which makes the following metadata deterministic:
+
+```json
+{
+  "key_id": "key_2",
+  "fallback_attempts": 1
+}
+```
+
+### Errors That Trigger Failover
+
+The next key is attempted for:
+
+- `429` / quota or rate-limit errors
+- `408` / timeout errors
+- timeout exceptions
+- connection errors
+- `5xx` provider failures
+- `401` / `403` authentication failures
+
+Invalid or revoked credentials therefore automatically fall through to the next configured key.
+
+### Non-Retryable Errors
+
+Other `4xx` responses, such as malformed provider requests, do **not** consume another key.
+
+They return:
+
+```json
+{
+  "detail": "provider rejected the request"
+}
+```
+
+with HTTP `502`.
+
+If every configured key fails:
+
+```json
+{
+  "detail": "all providers unavailable"
+}
+```
+
+is returned with HTTP `503`.
+
+### Key Safety
+
+Raw API keys never leave the LLM gateway.
+
+Only safe identifiers such as:
+
+```text
+key_1
+key_2
+```
+
+appear in responses and logs.
+
+Logs record the key ID and exception **class name**, but never provider exception text, since provider errors may contain credentials.
+
+---
+
+## Response Caching
+
+The application uses two cache layers:
+
+```text
+Request
+   │
+   ▼
+Gateway LRU Cache
+   │ miss
+   ▼
+LiteLLM Cache
+   │ miss
+   ▼
+Provider
+```
+
+LiteLLM caching is enabled at startup:
+
+```python
+litellm.cache = Cache(type="local")
+```
+
+and live calls use:
+
+```python
+caching=True
+```
+
+The gateway additionally maintains a small deterministic in-process LRU.
+
+### Cache Key
+
+Entries are keyed using:
+
+```text
+SHA-256(
+    model
+    +
+    complete ordered message array
+)
+```
+
+The message array includes:
+
+```text
+system prompt
++ previous conversation history
++ new user message
+```
+
+This prevents incorrect cache sharing between conversations with different prompts or histories.
+
+### Cache Hits
+
+A cache hit:
+
+- Makes **no provider request**
+- Uses **no API key**
+- Reports `key_id: null`
+- Reports `fallback_attempts: 0`
+- Preserves the original request's token counts
+- Returns significantly lower latency
+
+Example metadata:
+
+```json
+{
+  "resolution_source": "LLM_CACHE",
+  "key_id": null,
+  "fallback_attempts": 0
+}
+```
+
+Requests using `X-Simulate-Failure` bypass both cache reads and writes so failover behaviour can always be tested reliably.
+
+---
+
+## SQLite Session Persistence
+
+The application uses Python's standard `sqlite3` module with **WAL mode** enabled.
+
+The schema is automatically created during startup.
+
+### Sessions
+
+`sessions` stores session-level data such as the `system_prompt`.
+
+The `messages` table therefore remains a clean transcript containing only:
+
+```text
+user
+assistant
+```
+
+messages.
+
+### Atomic Turns
+
+Each successful chat turn is stored in a single transaction:
+
+```text
+BEGIN IMMEDIATE
+
+  session upsert
+  + user message
+  + assistant message
+  + assistant metadata
+
+COMMIT
+```
+
+If generation or validation fails, nothing from that turn is persisted.
+
+Assistant metadata includes information such as:
+
+```text
+source
+model
+key_id
+fallback_attempts
+input_tokens
+output_tokens
+latency
+created_at
+```
+
+Timestamps use UTC ISO-8601 format.
+
+### Conversation Ordering
+
+History is loaded using:
+
+```sql
+ORDER BY id ASC
+```
+
+A per-session `asyncio.Lock` serializes:
+
+```text
+read history
+    ↓
+LLM request
+    ↓
+persist turn
+```
+
+This prevents two simultaneous requests in the same session from interleaving conversation turns.
+
+Token counts always represent the **individual provider request**, not a cumulative session total.
+
+---
+
+## Input Validation
+
+The API validates input before opening the database.
+
+### `session_id`
+
+- Must be a JSON string
+- Trimmed before validation
+- Length: **1–128 characters**
+
+### `message`
+
+- Must be a JSON string
+- Trimmed before validation
+- Length: **1–4000 characters**
+
+Malformed JSON, incorrect types, and invalid lengths return HTTP `422`.
+
+Validation responses use a compact `detail` structure and never echo user input.
+
+---
+
+# 5. Verification
+
+The important reliability behaviours can be tested directly through the API.
+
+Enable failure simulation:
+
+```env
+ENABLE_FAILURE_SIMULATION=true
+```
+
+For failover testing, configure at least two keys.
+
+The frontend also exposes failure simulation through a dropdown, so these behaviours can be demonstrated without `curl`.
+
+---
+
+## Health Check
 
 ```bash
 curl -s localhost:8000/health
-# {"status":"ok","keys_configured":2,"cache_enabled":true}
 ```
 
-**Multi-turn persistence and token usage**
+Example:
+
+```json
+{
+  "status": "ok",
+  "keys_configured": 2,
+  "cache_enabled": true
+}
+```
+
+---
+
+## Multi-Turn Persistence
+
+Send the first message:
 
 ```bash
-curl -s localhost:8000/chat -H 'content-type: application/json' \
+curl -s localhost:8000/chat \
+  -H 'content-type: application/json' \
   -d '{"session_id":"demo","message":"What is the capital of France?"}'
-curl -s localhost:8000/chat -H 'content-type: application/json' \
+```
+
+Continue the same conversation:
+
+```bash
+curl -s localhost:8000/chat \
+  -H 'content-type: application/json' \
   -d '{"session_id":"demo","message":"And its population?"}'
+```
+
+Inspect the persisted transcript:
+
+```bash
 curl -s localhost:8000/sessions/demo/messages
 ```
 
-Each assistant message carries its own `metadata`, including that request's `input_tokens` / `output_tokens`. The second turn's input count is larger because the history is resent, but it is not cumulative. In the UI, each reply shows source, model, latency and tokens under the message.
+Each assistant message contains metadata for its own request, including:
 
-**Cache hit**
+```text
+input_tokens
+output_tokens
+```
+
+The second request normally has a larger input-token count because previous conversation history is sent back to the model.
+
+These counts are **per request**, not cumulative.
+
+---
+
+## Verify a Cache Hit
+
+Make the same effective request from another session:
 
 ```bash
-curl -s localhost:8000/chat -H 'content-type: application/json' \
+curl -s localhost:8000/chat \
+  -H 'content-type: application/json' \
   -d '{"session_id":"another","message":"What is the capital of France?"}'
-# resolution_source: LLM_CACHE, key_id: null, fallback_attempts: 0, same reply and token counts, lower latency_ms
 ```
 
-**Failover**
+A successful cache hit reports:
+
+```json
+{
+  "resolution_source": "LLM_CACHE",
+  "key_id": null,
+  "fallback_attempts": 0
+}
+```
+
+The reply and token counts are preserved while latency is substantially lower.
+
+---
+
+## Verify Key Failover
+
+Force `key_1` to behave as if it received a `429`:
 
 ```bash
-curl -s localhost:8000/chat -H 'content-type: application/json' -H 'X-Simulate-Failure: key_1=429' \
+curl -s localhost:8000/chat \
+  -H 'content-type: application/json' \
+  -H 'X-Simulate-Failure: key_1=429' \
   -d '{"session_id":"f1","message":"hello"}'
-# 200, key_id: "key_2", fallback_attempts: 1
-
-curl -s -i localhost:8000/chat -H 'content-type: application/json' -H 'X-Simulate-Failure: *=429' \
-  -d '{"session_id":"f2","message":"hello"}'
-# 503 {"detail":"all providers unavailable"}
-curl -s -i localhost:8000/sessions/f2/messages     # 404: the failed turn wrote nothing
 ```
 
-Header format: comma-separated `<key_id>=<status>` pairs (`key_1=429, key_2=500`) or `*=<status>`, with statuses `429, 500, 502, 503`. It applies only to that request.
+Expected result:
 
-**Automated:** `make test` runs 41 tests, covering all six required behaviours plus cache-key isolation, bypass, key-leak and rollback checks.
+```json
+{
+  "key_id": "key_2",
+  "fallback_attempts": 1
+}
+```
 
-## 5. Setup Used: your editor and AI tools
+with HTTP `200`.
 
-Built with Claude (Sonnet 5.5) through Claude Code, driven by a single written specification. Backend verification used `pytest` with a mocked `litellm.acompletion`. Edit this section to list your own editor and tooling if they differ.
+---
 
-## 6. Bonus features (if any): what you added beyond the requirements and why
+## Verify Total Provider Failure
 
-- **Failure-simulation dropdown in the UI.** Failover and `503` handling can be demoed live without `curl`.
-- **Visual source pills and failover badge.** Green `LLM_CACHE`, blue `LIVE_INFERENCE`, and an amber `key_2 · 1 failover` badge, so a reviewer can tell at a glance what happened.
-- **Per-session lock.** Prevents interleaved turns from concurrent sends in one session.
-- **Two-tier cache.** LiteLLM's cache plus a deterministic gateway LRU, so hits are verifiable without a live provider.
-- **Hardened errors.** Compact `422` bodies that never echo input, `502` for non-retryable provider errors that do not burn the second key, and empty provider replies treated as a failover-worthy fault.
-- **Non-root, healthchecked containers.** The backend runs as an unprivileged user with a stdlib-based healthcheck, so the frontend only starts once the API is ready.
-- **Keys never leave the gateway.** A test asserts raw keys appear in no response body, header or log line, even when the provider's error text contains one.
-#   l y f t r - l l m - c h a t b o t 
- 
- #   l y f t r - l l m - c h a t b o t 
+Force every key to fail:
+
+```bash
+curl -s -i localhost:8000/chat \
+  -H 'content-type: application/json' \
+  -H 'X-Simulate-Failure: *=429' \
+  -d '{"session_id":"f2","message":"hello"}'
+```
+
+Expected:
+
+```text
+HTTP 503
+```
+
+```json
+{
+  "detail": "all providers unavailable"
+}
+```
+
+Confirm that the failed turn was not persisted:
+
+```bash
+curl -s -i localhost:8000/sessions/f2/messages
+```
+
+Expected:
+
+```text
+HTTP 404
+```
+
+### Failure Simulation Format
+
+The header accepts comma-separated key/status pairs:
+
+```text
+X-Simulate-Failure: key_1=429,key_2=500
+```
+
+or all keys:
+
+```text
+X-Simulate-Failure: *=503
+```
+
+Supported simulated statuses:
+
+```text
+429, 500, 502, 503
+```
+
+Simulation applies only to the current request.
+
+---
+
+# 6. Testing
+
+Run the complete backend test suite with:
+
+```bash
+make test
+```
+
+The project includes **41 automated tests** covering the required behaviours and additional reliability cases, including:
+
+- Ordered key failover
+- Complete provider failure
+- Cache hits
+- Cache-key isolation
+- Cache bypass during failure simulation
+- Multi-turn persistence
+- Per-message token accounting
+- Input validation
+- Transaction rollback
+- API-key leak prevention
+
+Provider calls are mocked, so the test suite does not require network access or real API credentials.
+
+---
+
+# 7. UI Features
+
+The React frontend exposes the backend's reliability behaviour directly.
+
+### Failure Simulation
+
+A dropdown allows provider failures to be simulated without manually constructing HTTP requests.
+
+### Response Metadata
+
+Every assistant reply displays useful metadata such as:
+
+```text
+source • model • latency • token usage
+```
+
+Visual badges make the response path immediately visible:
+
+```text
+🟢 LLM_CACHE
+🔵 LIVE_INFERENCE
+🟠 key_2 · 1 failover
+```
+
+This makes caching and key failover easy to demonstrate during review.
+
+---
+
+# 8. Additional Engineering Features
+
+Beyond the core chatbot requirements, the project includes:
+
+**Failure simulation**  
+Provider failures can be triggered from the UI or `X-Simulate-Failure` header, making failover reproducible without waiting for a real provider outage.
+
+**Two-tier caching**  
+LiteLLM's built-in cache is combined with a deterministic gateway LRU, allowing cache behaviour to be tested independently of a live provider.
+
+**Per-session concurrency control**  
+An `asyncio.Lock` prevents concurrent requests from corrupting conversational ordering.
+
+**Atomic persistence**  
+A chat turn is written only after successful generation. Failed requests leave no partial database state.
+
+**Hardened error handling**  
+Non-retryable provider errors return a controlled `502`, exhausted providers return `503`, and empty provider responses are treated as failover-worthy failures.
+
+**Credential isolation**  
+Raw API keys remain inside the gateway. Automated tests verify that credentials cannot appear in response bodies, headers, or logs.
+
+**Healthchecked containers**  
+The backend runs as an unprivileged container user and exposes a health check. The frontend starts only after the API becomes healthy.
+
+---
+
+# 9. Development Tools
+
+The project was built with **Claude Code using Claude Sonnet 5.5**, based on a written project specification.
+
+Backend behaviour was verified using **pytest**, with `litellm.acompletion` mocked to provide deterministic tests without consuming real API quota.
+
+---
+
+## Summary
+
+Lyftr demonstrates a small but production-minded LLM application where reliability behaviour is explicit and testable:
+
+```text
+                 ┌───────────────┐
+                 │ React + Vite  │
+                 └───────┬───────┘
+                         │
+                         ▼
+                 ┌───────────────┐
+                 │    FastAPI    │
+                 └───────┬───────┘
+                         │
+               ┌─────────┴─────────┐
+               │                   │
+               ▼                   ▼
+        ┌─────────────┐      ┌───────────┐
+        │ Cache Layer │      │  SQLite   │
+        └──────┬──────┘      │ Sessions  │
+               │ miss        └───────────┘
+               ▼
+        ┌─────────────┐
+        │ LLM Gateway │
+        └──────┬──────┘
+               │
+         key_1 │ → failure
+               ▼
+         key_2 │ → success
+               ▼
+        ┌─────────────┐
+        │   LiteLLM   │
+        │  Provider   │
+        └─────────────┘
+```
+
+The result is a chatbot with **deterministic caching, observable failover, persistent conversations, accurate per-request accounting, and reproducible failure testing**.
