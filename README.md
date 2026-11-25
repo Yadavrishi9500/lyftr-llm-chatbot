@@ -149,6 +149,6 @@ Built with Claude (Sonnet 5.5) through Claude Code, driven by a single written s
 - **Hardened errors.** Compact `422` bodies that never echo input, `502` for non-retryable provider errors that do not burn the second key, and empty provider replies treated as a failover-worthy fault.
 - **Non-root, healthchecked containers.** The backend runs as an unprivileged user with a stdlib-based healthcheck, so the frontend only starts once the API is ready.
 - **Keys never leave the gateway.** A test asserts raw keys appear in no response body, header or log line, even when the provider's error text contains one.
-#   l y f t r - l l m - c h a t b o t  
- #   l y f t r - l l m - c h a t b o t  
+#   l y f t r - l l m - c h a t b o t 
  
+ #   l y f t r - l l m - c h a t b o t 
